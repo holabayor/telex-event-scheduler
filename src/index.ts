@@ -1,8 +1,10 @@
-import express, { Application } from 'express';
+import express, { Application, Request, Response } from 'express';
 import Storage from './data/storage';
-import { EventData, TelexEventRequest, TickPayload } from './types';
-import { parseEventCommand } from './utils';
+import { EventData, TelexEventRequest } from './types';
+import { parseEventCommand, sendMessageToTelex } from './utils';
 import { BackgroundTaskQueue } from './queue';
+import { eventValidator } from './validators';
+import { validationResult } from 'express-validator';
 
 const app: Application = express();
 const PORT = process.env.PORT || 3000;
@@ -48,7 +50,7 @@ app.get('/integration-json', (req, res) => {
           label: 'reminder-interval',
           description: 'The default reminder interval in minutes',
           type: 'number',
-          default: 15,
+          default: '2',
           required: true,
         },
         {
@@ -64,54 +66,79 @@ app.get('/integration-json', (req, res) => {
   });
 });
 
-app.post('/event', (req, res) => {
-  try {
-    const { message, channel_id, settings } = req.body as TelexEventRequest;
+app.post('/event', eventValidator, (req: Request, res: Response) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    res.status(400).json({ errors: errors.array() });
+    return;
+  }
 
-    console.log('The request body is', { message, channel_id, settings });
+  console.log("Current events", storage.getEvents().length);
+
+  const { message, channel_id, settings } = req.body as TelexEventRequest;
+  try {
+    // Remove any HTML tags and trim whitespace
+    const cleanedMessage = message.replace(/<[^>]*>/g, ' ').trim();
 
     // Check if message begins with '/event'
-    const cleanedMessage = message.replace(/<\/?p>/g, '').trim();
-    if (cleanedMessage.startsWith('/event') === false) {
+    if (cleanedMessage.startsWith('/event') === true) {
+
+
+      const { title, date, time } = parseEventCommand(cleanedMessage);
+
+      // Find the default reminder interval from settings
+      const reminderIntervalSetting = settings.find(
+        (setting) => setting.label === 'reminder-interval'
+      );
+      if (!reminderIntervalSetting) {
+        throw new Error('Reminder interval setting not found');
+      }
+      const reminderInterval = reminderIntervalSetting.default;
+
+      const eventData: EventData = {
+        id: Date.now().toString(),
+        title,
+        date,
+        time,
+        channelId: channel_id,
+        reminders: [
+          {
+            intervalInMinutes: parseInt(reminderInterval),
+            label: `${reminderInterval} minutes before`,
+          },
+        ],
+      };
+
+      storage.addEvent(eventData);
+      sendMessageToTelex(`${title} scheduled for ${date} at ${time}`, channel_id);
+
+      console.log(`Event added: ${eventData}`);
+
+      res.status(200).send({
+        event_name: 'Event Scheduled',
+        message: `${title} scheduled for ${date} at ${time}`,
+        status: 'success',
+        username: 'Event Scheduler',
+      });
       return;
     }
 
-    const { title, date, time } = parseEventCommand(cleanedMessage);
-
-    const reminderIntervalSetting = settings.find(
-      (setting) => setting.label === 'reminder-interval'
-    );
-    if (!reminderIntervalSetting) {
-      throw new Error('Reminder interval setting not found');
-    }
-
-    const reminderInterval = reminderIntervalSetting.default;
-    const eventData: EventData = {
-      id: Date.now().toString(),
-      title,
-      date,
-      time,
-      channelId: channel_id,
-      reminders: [
-        {
-          intervalInMinutes: parseInt(reminderInterval),
-          label: `${reminderInterval} minutes before`,
-        },
-      ],
-    };
-
-    console.log(`Event received for channel: ${channel_id}`);
-    storage.addEvent(eventData);
-
-    res.status(200).send({ message: 'Event received correctly' });
   } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: 'An error occurred' });
+    let message = 'An error occurred';
+    if (error instanceof Error) {
+      message = error.message;
+    }
+    sendMessageToTelex(message, channel_id, 'error');
+    res.status(500).send({ message });
+    return;
   }
 });
 
 app.post('/tick', (req, res) => {
-  const payload: TickPayload = req.body;
+  //   const payload: TickPayload = req.body;
+
+  console.log('Tick received:');
+
   taskQueue.addTask(async () => {
     const events = storage.getEvents();
     const now = new Date();
@@ -128,35 +155,27 @@ app.post('/tick', (req, res) => {
         const reminderTime = new Date(
           eventDateTime.getTime() - reminder.intervalInMinutes * 60000
         );
+        console.log('Reminder time for ', event.title, ' is ', reminderTime);
+        console.log(
+          'Time to send reminder: ',
+          reminderTime.getTime() - now.getTime()
+        );
 
         // Send reminder if the reminder time is within a minute of the current time
         if (Math.abs(now.getTime() - reminderTime.getTime()) < 60000) {
-          try {
-            await fetch(payload.return_url, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                event_name: `${event.title} Reminder`,
-                username: 'Event Scheduler',
-                status: 'success',
-                message: `"${event.title}" is scheduled for ${event.date} at ${event.time}.`,
-              }),
-            });
-            console.log('Reminder sent');
-          } catch (error) {
-            console.error('Error:', error);
-          }
+          // if (now.getTime() >= eventDateTime.getTime()) {
+          sendMessageToTelex(
+            `Event Reminder: ${event.title} is scheduled for ${event.date} at ${event.time}`,
+            event.channelId
+          );
         } else {
           console.log('No reminders due');
         }
       });
     });
-
-    res.status(200).send({ message: 'Tick received' });
   });
-  res.status(202).send({ status: 'accepted' });
+  res.status(202).json({ status: 'accepted' });
+  return;
 });
 
 app.listen(PORT, () => {

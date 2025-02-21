@@ -7,7 +7,7 @@ interface Settings {
   label: string;
   description?: string;
   type: string;
-  required: boolean;
+  required: any;
   default: string;
 }
 
@@ -31,4 +31,10 @@ export interface TickPayload {
   channel_id: string;
   return_url: string;
   settings: Settings[];
+}
+
+export interface ParsedEvent {
+  title: string;
+  date: string;
+  time: string;
 }
